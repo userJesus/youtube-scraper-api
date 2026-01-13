@@ -10,7 +10,7 @@ app = FastAPI(title="YouTube Scraper (Videos, Lives, Shorts)")
 
 YOUTUBE_ROOT = "https://www.youtube.com"
 
-# --- Modelo de Resposta Atualizado (Apenas o que você pediu) ---
+# --- Modelo de Resposta ---
 class VideoItem(BaseModel):
     url: str
     title: str
@@ -47,6 +47,7 @@ def _extract_ytinitialdata(html: str) -> Dict[str, Any]:
     return json.loads(m.group(1))
 
 def _walk(obj: Any):
+    """Percorre recursivamente o JSON"""
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield k, v
@@ -58,72 +59,96 @@ def _walk(obj: Any):
 def _pick_text(t: Any) -> str:
     if not isinstance(t, dict): return ""
     if "simpleText" in t: return t["simpleText"]
+    if "content" in t: return t["content"] # Usado em alguns ViewModels novos
     if "runs" in t: return "".join(r.get("text", "") for r in t["runs"])
     return ""
 
-def _parse_renderer(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _parse_item(data: Dict[str, Any], is_short: bool = False) -> Optional[Dict[str, Any]]:
     """
-    Parser robusto para Vídeos, Lives e Shorts
+    Parser universal que detecta o tipo de item e extrai os dados.
+    Suporta: videoRenderer, reelItemRenderer, shortsLockupViewModel
     """
     video_id = None
-    
-    # 1. Tenta pegar o ID (pode estar na raiz ou dentro do endpoint)
+    title = ""
+    thumb = ""
+    desc = ""
+
+    # --- ESTRATÉGIA 1: Format Antigo (Renderers) ---
     if "videoId" in data:
         video_id = data["videoId"]
+        title = _pick_text(data.get("title", {})) or _pick_text(data.get("headline", {}))
+        
+        if "thumbnail" in data:
+            thumbs = data["thumbnail"].get("thumbnails", [])
+            if thumbs: thumb = thumbs[-1].get("url", "")
+            
+        if "descriptionSnippet" in data:
+            desc = _pick_text(data["descriptionSnippet"])
+
+    # --- ESTRATÉGIA 2: Format Novo (ViewModels / Shorts) ---
+    # O YouTube agora usa 'shortsLockupViewModel' onde o ID fica dentro de um evento de click
+    elif "onTap" in data:
+        # Tenta achar o ID dentro do comando de navegação
+        cmd = data["onTap"]
+        for k, v in _walk(cmd):
+            if k in ("reelWatchEndpoint", "watchEndpoint") and "videoId" in v:
+                video_id = v["videoId"]
+                break
+        
+        # Se achou ID, tenta achar metadados no mesmo nível
+        if video_id:
+            # Título geralmente está em overlayMetadata -> primaryText
+            if "overlayMetadata" in data:
+                overlay = data["overlayMetadata"]
+                title = _pick_text(overlay.get("primaryText", {}))
+            
+            # Thumbnail geralmente está direto no objeto ou em 'thumbnail'
+            if "thumbnail" in data:
+                 thumbs = data["thumbnail"].get("sources", [])
+                 if thumbs: thumb = thumbs[-1].get("url", "")
+
+    # --- ESTRATÉGIA 3: Navigation Endpoint (Reels antigos) ---
     elif "navigationEndpoint" in data:
-        # Shorts costumam esconder o ID aqui
-        nav = data["navigationEndpoint"]
-        if "watchEndpoint" in nav and "videoId" in nav["watchEndpoint"]:
-            video_id = nav["watchEndpoint"]["videoId"]
-        elif "reelWatchEndpoint" in nav and "videoId" in nav["reelWatchEndpoint"]:
-            video_id = nav["reelWatchEndpoint"]["videoId"]
-    
+         nav = data["navigationEndpoint"]
+         if "reelWatchEndpoint" in nav:
+             video_id = nav["reelWatchEndpoint"].get("videoId")
+             title = _pick_text(data.get("headline", {}))
+             if "thumbnail" in data:
+                thumbs = data.get("thumbnail", {}).get("thumbnails", [])
+                if thumbs: thumb = thumbs[0].get("url", "")
+
     if not video_id:
         return None
 
-    # 2. Título (Vídeos usam 'title', Shorts usam 'headline')
-    title = _pick_text(data.get("title", {})) or _pick_text(data.get("headline", {}))
-    
-    # 3. Descrição (Snippet)
-    desc = ""
-    if "descriptionSnippet" in data:
-        desc = _pick_text(data["descriptionSnippet"])
-    elif data.get("detailedMetadataSnippets"):
-        desc = _pick_text(data["detailedMetadataSnippets"][0].get("snippetText", {}))
-
-    # 4. Thumbnail
-    thumb = ""
-    if "thumbnail" in data:
-        thumbs = data["thumbnail"].get("thumbnails", [])
-        if thumbs: thumb = thumbs[-1].get("url", "")
-    elif "thumbnails" in data: # Alguns shorts usam estrutura diferente
-        thumbs = data["thumbnails"]
-        if thumbs: thumb = thumbs[0].get("url", "")
+    # Formatação da URL
+    if is_short:
+        final_url = f"{YOUTUBE_ROOT}/shorts/{video_id}"
+    else:
+        final_url = f"{YOUTUBE_ROOT}/watch?v={video_id}"
 
     return {
-        "id_interno": video_id, # Usado apenas para deduplicar, não sai no JSON final
-        "url": f"{YOUTUBE_ROOT}/watch?v={video_id}", # Ou /shorts/, mas watch funciona pra tudo
+        "id_interno": video_id,
+        "url": final_url,
         "title": title,
-        "description": desc,
+        "description": desc, # Shorts geralmente não têm snippet de descrição na lista
         "thumbnail": thumb
     }
 
-def _extract_items_and_continuation(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _extract_from_initial_data(data: Dict[str, Any], is_short_tab: bool) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     items = []
     continuation = None
     
-    # Procura por renderers conhecidos
-    # reelItemRenderer = Shorts
-    # videoRenderer = Videos/Lives passadas
-    # gridVideoRenderer = Videos em layout de grade
+    # Chaves que indicam um vídeo/short válido
     target_keys = ("gridVideoRenderer", "videoRenderer", "reelItemRenderer", "shortsLockupViewModel")
-    
+
     for k, v in _walk(data):
         if k in target_keys and isinstance(v, dict):
-            parsed = _parse_renderer(v)
+            # Forçamos is_short=True se encontrarmos estruturas típicas de Shorts ou se estivermos na aba Shorts
+            is_item_short = is_short_tab or k in ("reelItemRenderer", "shortsLockupViewModel")
+            parsed = _parse_item(v, is_short=is_item_short)
             if parsed: items.append(parsed)
-            
-    # Procura token de continuação
+
+    # Busca token de continuação
     for k, v in _walk(data):
         if k == "continuationItemRenderer":
             token = v.get("continuationEndpoint", {}).get("continuationCommand", {}).get("token")
@@ -136,10 +161,10 @@ def _extract_items_and_continuation(data: Dict[str, Any]) -> Tuple[List[Dict[str
             if k == "continuationCommand" and v.get("token"):
                 continuation = v["token"]
                 break
-                
+
     return items, continuation
 
-def _browse_continuation(session, api_key, client_version, continuation, referer):
+def _browse_req(session, api_key, client_version, continuation, referer):
     url = f"{YOUTUBE_ROOT}/youtubei/v1/browse?key={api_key}"
     headers = {
         "Content-Type": "application/json",
@@ -158,17 +183,28 @@ def _browse_continuation(session, api_key, client_version, continuation, referer
         "continuation": continuation,
     }
     try:
-        resp = session.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code >= 400: return {}
-        return resp.json()
+        r = session.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code >= 400: return {}
+        return r.json()
     except:
         return {}
 
-def scrape_specific_tab(session, base_url: str, tab_suffix: str, max_items: Optional[int]) -> List[Dict[str, Any]]:
-    target_url = base_url.rstrip("/") + tab_suffix
+def scrape_tab(session, base_url: str, tab: str, max_items: Optional[int]) -> List[Dict[str, Any]]:
+    # Define a URL da aba
+    if tab == "shorts":
+        target_url = base_url.rstrip("/") + "/shorts"
+    elif tab == "lives":
+        target_url = base_url.rstrip("/") + "/streams"
+    else:
+        target_url = base_url.rstrip("/") + "/videos"
+
+    print(f"Acessando: {target_url}")
+    
     try:
         r = session.get(target_url, timeout=20)
-        if r.status_code != 200: return []
+        # Se redirecionar ou não for 200, assume vazio
+        if r.url != target_url and tab != "videos": # Às vezes /videos redireciona para Home se vazio, ok ignorar
+             pass 
         
         html = r.text
         try:
@@ -180,28 +216,28 @@ def scrape_specific_tab(session, base_url: str, tab_suffix: str, max_items: Opti
         items = []
         seen_ids = set()
         
-        page_items, continuation = _extract_items_and_continuation(initial)
+        # Extração inicial
+        page_items, continuation = _extract_from_initial_data(initial, is_short_tab=(tab=="shorts"))
+        
         for i in page_items:
             if i["id_interno"] not in seen_ids:
                 seen_ids.add(i["id_interno"])
-                # Remove o ID interno antes de salvar na lista final
-                i_clean = {k: v for k, v in i.items() if k != "id_interno"}
-                items.append(i_clean)
+                items.append({k:v for k,v in i.items() if k != "id_interno"})
 
+        # Paginação
         while continuation:
             if max_items and len(items) >= max_items: break
             time.sleep(0.1)
             
-            data = _browse_continuation(session, api_key, client_version, continuation, target_url)
-            page_items, new_cont = _extract_items_and_continuation(data)
+            data = _browse_req(session, api_key, client_version, continuation, target_url)
+            page_items, new_cont = _extract_from_initial_data(data, is_short_tab=(tab=="shorts"))
             
             if not page_items: break
 
             for i in page_items:
                 if i["id_interno"] not in seen_ids:
                     seen_ids.add(i["id_interno"])
-                    i_clean = {k: v for k, v in i.items() if k != "id_interno"}
-                    items.append(i_clean)
+                    items.append({k:v for k,v in i.items() if k != "id_interno"})
                     if max_items and len(items) >= max_items: break
             
             if not new_cont or new_cont == continuation: break
@@ -209,24 +245,24 @@ def scrape_specific_tab(session, base_url: str, tab_suffix: str, max_items: Opti
 
         if max_items:
             items = items[:max_items]
-            
         return items
 
-    except Exception:
+    except Exception as e:
+        print(f"Erro em {tab}: {e}")
         return []
 
-# --- Rota Principal ---
+# --- Rota API ---
 
 @app.get("/")
 def home():
-    return {"message": "API YouTube Limpa (Videos, Lives, Shorts). Use /scrape"}
+    return {"message": "API YouTube Scraper V2. Use /scrape"}
 
 @app.get("/scrape", response_model=ChannelResponse)
-def scrape_all(
+def scrape_channel(
     channel_url: str = Query(..., description="URL do canal"),
-    max_videos: Optional[int] = Query(None, description="Limite vídeos"),
-    max_lives: Optional[int] = Query(None, description="Limite lives"),
-    max_shorts: Optional[int] = Query(None, description="Limite shorts"),
+    max_videos: Optional[int] = Query(None),
+    max_lives: Optional[int] = Query(None),
+    max_shorts: Optional[int] = Query(None),
 ):
     session = requests.Session()
     session.headers.update({
@@ -234,11 +270,13 @@ def scrape_all(
         "Accept-Language": "pt-BR"
     })
     
+    # Limpa URL
     base_url = channel_url.split("?")[0].rstrip("/")
-
-    videos = scrape_specific_tab(session, base_url, "/videos", max_videos)
-    lives = scrape_specific_tab(session, base_url, "/streams", max_lives)
-    shorts = scrape_specific_tab(session, base_url, "/shorts", max_shorts)
+    
+    # Coleta paralela (sequencial no código, mas separada)
+    videos = scrape_tab(session, base_url, "videos", max_videos)
+    lives = scrape_tab(session, base_url, "lives", max_lives)
+    shorts = scrape_tab(session, base_url, "shorts", max_shorts)
 
     return {
         "channel": base_url,
