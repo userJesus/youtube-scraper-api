@@ -6,18 +6,16 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-app = FastAPI(title="YouTube Multi-Tab Scraper (Videos, Lives, Shorts)")
+app = FastAPI(title="YouTube Scraper (Videos, Lives, Shorts)")
 
 YOUTUBE_ROOT = "https://www.youtube.com"
 
-# --- Modelos de Resposta ---
+# --- Modelo de Resposta Atualizado (Apenas o que você pediu) ---
 class VideoItem(BaseModel):
-    id: str
     url: str
     title: str
     description: str
     thumbnail: str
-    view_count: str = "" # Opcional, útil se disponível
 
 class ChannelResponse(BaseModel):
     channel: str
@@ -28,17 +26,16 @@ class ChannelResponse(BaseModel):
     lives: List[VideoItem]
     shorts: List[VideoItem]
 
-# --- Funções Auxiliares de Extração ---
+# --- Funções Auxiliares ---
 
 def _extract_innertube(html: str) -> Tuple[str, str]:
     api_key_m = re.search(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"', html)
     ver_m = re.search(r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"', html)
     if not api_key_m or not ver_m:
-        # Tenta fallback para outro padrão comum
         api_key_m = re.search(r'INNERTUBE_API_KEY":"([^"]+)"', html)
         ver_m = re.search(r'INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
         if not api_key_m or not ver_m:
-            raise RuntimeError("Não foi possível extrair chaves da API do YouTube.")
+            raise RuntimeError("Não foi possível extrair chaves da API.")
     return api_key_m.group(1), ver_m.group(1)
 
 def _extract_ytinitialdata(html: str) -> Dict[str, Any]:
@@ -46,11 +43,10 @@ def _extract_ytinitialdata(html: str) -> Dict[str, Any]:
     if not m:
         m = re.search(r"ytInitialData\s*=\s*(\{.*?\});", html, flags=re.DOTALL)
     if not m:
-        raise RuntimeError("Não foi possível extrair dados iniciais do HTML.")
+        raise RuntimeError("Não foi possível extrair dados iniciais.")
     return json.loads(m.group(1))
 
 def _walk(obj: Any):
-    """Percorre recursivamente o JSON complexo do YouTube"""
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield k, v
@@ -60,7 +56,6 @@ def _walk(obj: Any):
             yield from _walk(it)
 
 def _pick_text(t: Any) -> str:
-    """Extrai texto de estruturas complexas do YouTube"""
     if not isinstance(t, dict): return ""
     if "simpleText" in t: return t["simpleText"]
     if "runs" in t: return "".join(r.get("text", "") for r in t["runs"])
@@ -68,47 +63,63 @@ def _pick_text(t: Any) -> str:
 
 def _parse_renderer(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Analisa tanto Vídeos/Lives (videoRenderer) quanto Shorts (reelItemRenderer)
+    Parser robusto para Vídeos, Lives e Shorts
     """
-    # 1. Tenta formato padrão (Vídeos e Lives)
-    if "videoId" in data and ("title" in data or "headline" in data):
-        vid = data["videoId"]
-        title = _pick_text(data.get("title", {})) or _pick_text(data.get("headline", {}))
-        
-        # Descrição
-        desc = ""
-        if "descriptionSnippet" in data:
-            desc = _pick_text(data["descriptionSnippet"])
-        elif data.get("detailedMetadataSnippets"):
-            desc = _pick_text(data["detailedMetadataSnippets"][0].get("snippetText", {}))
-
-        # Thumbnail
-        thumb = ""
-        if "thumbnail" in data:
-            thumbs = data["thumbnail"].get("thumbnails", [])
-            if thumbs: thumb = thumbs[-1].get("url", "")
-        
-        # View Count (Visualizações)
-        views = _pick_text(data.get("viewCountText", {})) or _pick_text(data.get("shortViewCountText", {}))
-
-        return {
-            "id": vid,
-            "url": f"{YOUTUBE_ROOT}/watch?v={vid}",
-            "title": title,
-            "description": desc,
-            "thumbnail": thumb,
-            "view_count": views
-        }
+    video_id = None
     
-    return None
+    # 1. Tenta pegar o ID (pode estar na raiz ou dentro do endpoint)
+    if "videoId" in data:
+        video_id = data["videoId"]
+    elif "navigationEndpoint" in data:
+        # Shorts costumam esconder o ID aqui
+        nav = data["navigationEndpoint"]
+        if "watchEndpoint" in nav and "videoId" in nav["watchEndpoint"]:
+            video_id = nav["watchEndpoint"]["videoId"]
+        elif "reelWatchEndpoint" in nav and "videoId" in nav["reelWatchEndpoint"]:
+            video_id = nav["reelWatchEndpoint"]["videoId"]
+    
+    if not video_id:
+        return None
+
+    # 2. Título (Vídeos usam 'title', Shorts usam 'headline')
+    title = _pick_text(data.get("title", {})) or _pick_text(data.get("headline", {}))
+    
+    # 3. Descrição (Snippet)
+    desc = ""
+    if "descriptionSnippet" in data:
+        desc = _pick_text(data["descriptionSnippet"])
+    elif data.get("detailedMetadataSnippets"):
+        desc = _pick_text(data["detailedMetadataSnippets"][0].get("snippetText", {}))
+
+    # 4. Thumbnail
+    thumb = ""
+    if "thumbnail" in data:
+        thumbs = data["thumbnail"].get("thumbnails", [])
+        if thumbs: thumb = thumbs[-1].get("url", "")
+    elif "thumbnails" in data: # Alguns shorts usam estrutura diferente
+        thumbs = data["thumbnails"]
+        if thumbs: thumb = thumbs[0].get("url", "")
+
+    return {
+        "id_interno": video_id, # Usado apenas para deduplicar, não sai no JSON final
+        "url": f"{YOUTUBE_ROOT}/watch?v={video_id}", # Ou /shorts/, mas watch funciona pra tudo
+        "title": title,
+        "description": desc,
+        "thumbnail": thumb
+    }
 
 def _extract_items_and_continuation(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     items = []
     continuation = None
     
-    # Procura por Renderers de Vídeo, Grid de Vídeo ou Shorts (reelItem)
+    # Procura por renderers conhecidos
+    # reelItemRenderer = Shorts
+    # videoRenderer = Videos/Lives passadas
+    # gridVideoRenderer = Videos em layout de grade
+    target_keys = ("gridVideoRenderer", "videoRenderer", "reelItemRenderer", "shortsLockupViewModel")
+    
     for k, v in _walk(data):
-        if k in ("gridVideoRenderer", "videoRenderer", "reelItemRenderer") and isinstance(v, dict):
+        if k in target_keys and isinstance(v, dict):
             parsed = _parse_renderer(v)
             if parsed: items.append(parsed)
             
@@ -146,48 +157,40 @@ def _browse_continuation(session, api_key, client_version, continuation, referer
         },
         "continuation": continuation,
     }
-    resp = session.post(url, headers=headers, json=payload, timeout=30)
-    if resp.status_code >= 400: return {}
-    return resp.json()
-
-# --- Função Core de Raspagem por Aba ---
+    try:
+        resp = session.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code >= 400: return {}
+        return resp.json()
+    except:
+        return {}
 
 def scrape_specific_tab(session, base_url: str, tab_suffix: str, max_items: Optional[int]) -> List[Dict[str, Any]]:
-    """
-    Acessa uma aba específica (videos, streams, shorts) e baixa tudo.
-    """
     target_url = base_url.rstrip("/") + tab_suffix
-    print(f"Scraping tab: {target_url}")
-    
     try:
         r = session.get(target_url, timeout=20)
-        # Se a aba não existir (ex: canal não tem lives), o YouTube costuma redirecionar ou dar 200 na Home.
-        # O parser vai simplesmente não encontrar nada, o que é o comportamento correto (retorna lista vazia).
-        if r.status_code != 200:
-            return []
+        if r.status_code != 200: return []
         
         html = r.text
         try:
             api_key, client_version = _extract_innertube(html)
             initial = _extract_ytinitialdata(html)
         except:
-            # Se falhar em extrair dados iniciais, assume que a aba está vazia ou inacessível
             return []
 
         items = []
-        seen = set()
+        seen_ids = set()
         
         page_items, continuation = _extract_items_and_continuation(initial)
         for i in page_items:
-            if i["id"] not in seen:
-                seen.add(i["id"])
-                items.append(i)
+            if i["id_interno"] not in seen_ids:
+                seen_ids.add(i["id_interno"])
+                # Remove o ID interno antes de salvar na lista final
+                i_clean = {k: v for k, v in i.items() if k != "id_interno"}
+                items.append(i_clean)
 
-        # Loop de Paginação
         while continuation:
             if max_items and len(items) >= max_items: break
-            
-            time.sleep(0.1) # Delay anti-bloqueio
+            time.sleep(0.1)
             
             data = _browse_continuation(session, api_key, client_version, continuation, target_url)
             page_items, new_cont = _extract_items_and_continuation(data)
@@ -195,9 +198,10 @@ def scrape_specific_tab(session, base_url: str, tab_suffix: str, max_items: Opti
             if not page_items: break
 
             for i in page_items:
-                if i["id"] not in seen:
-                    seen.add(i["id"])
-                    items.append(i)
+                if i["id_interno"] not in seen_ids:
+                    seen_ids.add(i["id_interno"])
+                    i_clean = {k: v for k, v in i.items() if k != "id_interno"}
+                    items.append(i_clean)
                     if max_items and len(items) >= max_items: break
             
             if not new_cont or new_cont == continuation: break
@@ -208,36 +212,32 @@ def scrape_specific_tab(session, base_url: str, tab_suffix: str, max_items: Opti
             
         return items
 
-    except Exception as e:
-        print(f"Erro ao processar aba {tab_suffix}: {e}")
+    except Exception:
         return []
 
 # --- Rota Principal ---
 
 @app.get("/")
 def home():
-    return {"message": "API YouTube Completa (Videos, Lives, Shorts). Use /scrape"}
+    return {"message": "API YouTube Limpa (Videos, Lives, Shorts). Use /scrape"}
 
 @app.get("/scrape", response_model=ChannelResponse)
 def scrape_all(
     channel_url: str = Query(..., description="URL do canal"),
-    max_videos: Optional[int] = Query(None, description="Limite para vídeos normais"),
-    max_lives: Optional[int] = Query(None, description="Limite para lives"),
-    max_shorts: Optional[int] = Query(None, description="Limite para shorts"),
+    max_videos: Optional[int] = Query(None, description="Limite vídeos"),
+    max_lives: Optional[int] = Query(None, description="Limite lives"),
+    max_shorts: Optional[int] = Query(None, description="Limite shorts"),
 ):
     session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR"})
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept-Language": "pt-BR"
+    })
     
-    # Garante URL limpa
     base_url = channel_url.split("?")[0].rstrip("/")
 
-    # 1. Busca Vídeos (/videos)
     videos = scrape_specific_tab(session, base_url, "/videos", max_videos)
-    
-    # 2. Busca Lives (/streams)
     lives = scrape_specific_tab(session, base_url, "/streams", max_lives)
-    
-    # 3. Busca Shorts (/shorts)
     shorts = scrape_specific_tab(session, base_url, "/shorts", max_shorts)
 
     return {
