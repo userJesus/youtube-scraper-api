@@ -6,7 +6,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-app = FastAPI(title="YouTube Channel Scraper API")
+app = FastAPI(title="YouTube Channel Scraper API (Sem Limites)")
 
 YOUTUBE_ROOT = "https://www.youtube.com"
 
@@ -22,7 +22,7 @@ class ChannelResponse(BaseModel):
     count: int
     videos: List[VideoItem]
 
-# --- Funções Auxiliares (Do seu script original) ---
+# --- Funções Auxiliares ---
 
 def _extract_innertube(html: str) -> Tuple[str, str]:
     api_key_m = re.search(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"', html)
@@ -79,11 +79,13 @@ def _extract_videos_and_continuation(data: Dict[str, Any]) -> Tuple[List[Dict[st
     videos = []
     continuation = None
     
+    # Extrai vídeos da grade ou lista
     for k, v in _walk(data):
         if k in ("gridVideoRenderer", "videoRenderer"):
             parsed = _parse_video_renderer(v)
             if parsed: videos.append(parsed)
             
+    # Procura token de continuação (Paginação)
     for k, v in _walk(data):
         if k == "continuationItemRenderer":
             token = v.get("continuationEndpoint", {}).get("continuationCommand", {}).get("token")
@@ -91,6 +93,7 @@ def _extract_videos_and_continuation(data: Dict[str, Any]) -> Tuple[List[Dict[st
                 continuation = token
                 break
     
+    # Fallback para token
     if not continuation:
         for k, v in _walk(data):
             if k == "continuationCommand" and v.get("token"):
@@ -123,7 +126,7 @@ def _browse_continuation(session, api_key, client_version, continuation, referer
 
 def _fetch_full_description(session, video_url):
     try:
-        r = session.get(video_url, timeout=10) # Timeout menor para não travar a API
+        r = session.get(video_url, timeout=10)
         m = re.search(r"var\s+ytInitialPlayerResponse\s*=\s*(\{.*?\});", html := r.text, flags=re.DOTALL)
         if m:
             data = json.loads(m.group(1))
@@ -136,32 +139,30 @@ def _fetch_full_description(session, video_url):
 
 @app.get("/")
 def home():
-    return {"message": "YouTube Channel Scraper API is running. Use /scrape?channel_url=... to get videos."}
+    return {"message": "API YouTube Scraper Online. Use /scrape para buscar vídeos."}
 
 @app.get("/scrape", response_model=ChannelResponse)
 def scrape_channel(
-    channel_url: str = Query(..., description="URL completa do canal (ex: https://www.youtube.com/@NicoChat)"),
-    max_videos: Optional[int] = Query(10, description="Limite de vídeos para retornar"),
-    full_description: bool = Query(False, description="Se True, entra em cada vídeo para pegar descrição completa (Mais lento!)")
+    channel_url: str = Query(..., description="URL do canal"),
+    max_videos: Optional[int] = Query(None, description="Deixe vazio (null) para pegar TODOS. Coloque um número para limitar."),
+    full_description: bool = Query(False, description="Pega descrição completa (Deixa lento!)")
 ):
-    """
-    Coleta vídeos de um canal do YouTube.
-    """
     try:
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR"})
         videos_url = channel_url.rstrip("/") + "/videos"
 
-        # 1. Carregar página inicial do canal
+        # 1. Acesso inicial
         r = session.get(videos_url, timeout=30)
         if r.status_code != 200:
-            raise HTTPException(status_code=400, detail="Não foi possível acessar o canal. Verifique a URL.")
+            raise HTTPException(status_code=400, detail="Erro ao acessar canal.")
         
         html = r.text
         try:
             api_key, client_version = _extract_innertube(html)
             initial = _extract_ytinitialdata(html)
         except RuntimeError as e:
+            # Tenta fallback se falhar parsing inicial
             raise HTTPException(status_code=500, detail=str(e))
 
         videos = []
@@ -173,14 +174,22 @@ def scrape_channel(
                 seen.add(v["videoId"])
                 videos.append(v)
 
-        # 2. Loop de paginação
-        while continuation and (not max_videos or len(videos) < max_videos):
-            # Limite de segurança para não rodar infinito na API
-            if len(videos) >= 500: break 
+        # 2. Paginação (Loop para pegar o restante)
+        # Se max_videos for None, o loop continua até acabar os vídeos do canal
+        while continuation:
+            # Se o usuário definiu um limite, obedece. Se não, ignora.
+            if max_videos and len(videos) >= max_videos:
+                break
+            
+            # Pequeno delay para não bloquear o IP
+            time.sleep(0.1) 
             
             data = _browse_continuation(session, api_key, client_version, continuation, videos_url)
             page_videos, new_cont = _extract_videos_and_continuation(data)
             
+            if not page_videos: # Se não vier nada, para
+                break
+
             for v in page_videos:
                 if v["videoId"] not in seen:
                     seen.add(v["videoId"])
@@ -190,15 +199,14 @@ def scrape_channel(
             if not new_cont or new_cont == continuation: break
             continuation = new_cont
 
-        # Cortar excesso
+        # Corta lista final caso tenha passado um pouco
         if max_videos:
             videos = videos[:max_videos]
 
-        # 3. Descrição completa (Opcional - Pode deixar a API lenta)
+        # 3. Descrição completa (Opcional)
         if full_description:
             for v in videos:
-                full_desc = _fetch_full_description(session, v["url"])
-                if full_desc: v["description"] = full_desc
+                v["description"] = _fetch_full_description(session, v["url"])
 
         return {
             "channel": channel_url,
