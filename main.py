@@ -6,7 +6,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-app = FastAPI(title="YouTube Scraper (Videos, Lives, Shorts)")
+app = FastAPI(title="YouTube Scraper (Full Descriptions)")
 
 YOUTUBE_ROOT = "https://www.youtube.com"
 
@@ -47,7 +47,6 @@ def _extract_ytinitialdata(html: str) -> Dict[str, Any]:
     return json.loads(m.group(1))
 
 def _walk(obj: Any):
-    """Percorre recursivamente o JSON"""
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield k, v
@@ -59,56 +58,62 @@ def _walk(obj: Any):
 def _pick_text(t: Any) -> str:
     if not isinstance(t, dict): return ""
     if "simpleText" in t: return t["simpleText"]
-    if "content" in t: return t["content"] # Usado em alguns ViewModels novos
+    if "content" in t: return t["content"]
     if "runs" in t: return "".join(r.get("text", "") for r in t["runs"])
     return ""
 
+def _fetch_full_description_text(session, video_id: str) -> str:
+    """
+    Entra na página do vídeo/short e pega a descrição completa.
+    """
+    # Usamos a URL de /watch para tudo (inclusive shorts) pois contém o JSON padrão
+    url = f"{YOUTUBE_ROOT}/watch?v={video_id}"
+    try:
+        r = session.get(url, timeout=10)
+        html = r.text
+        
+        # Procura o objeto ytInitialPlayerResponse
+        m = re.search(r"var\s+ytInitialPlayerResponse\s*=\s*(\{.*?\});", html, flags=re.DOTALL)
+        if m:
+            data = json.loads(m.group(1))
+            # No JSON do player, a descrição completa chama-se 'shortDescription' (vai entender...)
+            details = data.get("videoDetails", {})
+            return details.get("shortDescription", "")
+    except Exception:
+        pass
+    return ""
+
 def _parse_item(data: Dict[str, Any], is_short: bool = False) -> Optional[Dict[str, Any]]:
-    """
-    Parser universal que detecta o tipo de item e extrai os dados.
-    Suporta: videoRenderer, reelItemRenderer, shortsLockupViewModel
-    """
     video_id = None
     title = ""
     thumb = ""
+    # Descrição inicial (geralmente truncada)
     desc = ""
 
-    # --- ESTRATÉGIA 1: Format Antigo (Renderers) ---
+    # Lógica de extração (VideoRenderer, ReelItemRenderer, ShortsLockupViewModel)
     if "videoId" in data:
         video_id = data["videoId"]
         title = _pick_text(data.get("title", {})) or _pick_text(data.get("headline", {}))
-        
         if "thumbnail" in data:
             thumbs = data["thumbnail"].get("thumbnails", [])
             if thumbs: thumb = thumbs[-1].get("url", "")
-            
         if "descriptionSnippet" in data:
             desc = _pick_text(data["descriptionSnippet"])
 
-    # --- ESTRATÉGIA 2: Format Novo (ViewModels / Shorts) ---
-    # O YouTube agora usa 'shortsLockupViewModel' onde o ID fica dentro de um evento de click
-    elif "onTap" in data:
-        # Tenta achar o ID dentro do comando de navegação
+    elif "onTap" in data: # Shorts novo layout
         cmd = data["onTap"]
         for k, v in _walk(cmd):
             if k in ("reelWatchEndpoint", "watchEndpoint") and "videoId" in v:
                 video_id = v["videoId"]
                 break
-        
-        # Se achou ID, tenta achar metadados no mesmo nível
         if video_id:
-            # Título geralmente está em overlayMetadata -> primaryText
             if "overlayMetadata" in data:
-                overlay = data["overlayMetadata"]
-                title = _pick_text(overlay.get("primaryText", {}))
-            
-            # Thumbnail geralmente está direto no objeto ou em 'thumbnail'
+                title = _pick_text(data["overlayMetadata"].get("primaryText", {}))
             if "thumbnail" in data:
                  thumbs = data["thumbnail"].get("sources", [])
                  if thumbs: thumb = thumbs[-1].get("url", "")
 
-    # --- ESTRATÉGIA 3: Navigation Endpoint (Reels antigos) ---
-    elif "navigationEndpoint" in data:
+    elif "navigationEndpoint" in data: # Shorts antigo
          nav = data["navigationEndpoint"]
          if "reelWatchEndpoint" in nav:
              video_id = nav["reelWatchEndpoint"].get("videoId")
@@ -120,7 +125,6 @@ def _parse_item(data: Dict[str, Any], is_short: bool = False) -> Optional[Dict[s
     if not video_id:
         return None
 
-    # Formatação da URL
     if is_short:
         final_url = f"{YOUTUBE_ROOT}/shorts/{video_id}"
     else:
@@ -130,32 +134,27 @@ def _parse_item(data: Dict[str, Any], is_short: bool = False) -> Optional[Dict[s
         "id_interno": video_id,
         "url": final_url,
         "title": title,
-        "description": desc, # Shorts geralmente não têm snippet de descrição na lista
+        "description": desc, # Será substituída se full_desc=True
         "thumbnail": thumb
     }
 
-def _extract_from_initial_data(data: Dict[str, Any], is_short_tab: bool) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _extract_from_data(data: Dict[str, Any], is_short_tab: bool) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     items = []
     continuation = None
-    
-    # Chaves que indicam um vídeo/short válido
     target_keys = ("gridVideoRenderer", "videoRenderer", "reelItemRenderer", "shortsLockupViewModel")
 
     for k, v in _walk(data):
         if k in target_keys and isinstance(v, dict):
-            # Forçamos is_short=True se encontrarmos estruturas típicas de Shorts ou se estivermos na aba Shorts
             is_item_short = is_short_tab or k in ("reelItemRenderer", "shortsLockupViewModel")
             parsed = _parse_item(v, is_short=is_item_short)
             if parsed: items.append(parsed)
 
-    # Busca token de continuação
     for k, v in _walk(data):
         if k == "continuationItemRenderer":
             token = v.get("continuationEndpoint", {}).get("continuationCommand", {}).get("token")
             if token:
                 continuation = token
                 break
-    
     if not continuation:
         for k, v in _walk(data):
             if k == "continuationCommand" and v.get("token"):
@@ -184,28 +183,17 @@ def _browse_req(session, api_key, client_version, continuation, referer):
     }
     try:
         r = session.post(url, headers=headers, json=payload, timeout=30)
-        if r.status_code >= 400: return {}
-        return r.json()
+        return r.json() if r.status_code < 400 else {}
     except:
         return {}
 
-def scrape_tab(session, base_url: str, tab: str, max_items: Optional[int]) -> List[Dict[str, Any]]:
-    # Define a URL da aba
-    if tab == "shorts":
-        target_url = base_url.rstrip("/") + "/shorts"
-    elif tab == "lives":
-        target_url = base_url.rstrip("/") + "/streams"
-    else:
-        target_url = base_url.rstrip("/") + "/videos"
+def scrape_tab(session, base_url: str, tab: str, max_items: Optional[int], fetch_full_desc: bool) -> List[Dict[str, Any]]:
+    suffix = "/shorts" if tab == "shorts" else ("/streams" if tab == "lives" else "/videos")
+    target_url = base_url.rstrip("/") + suffix
+    print(f"Scraping {tab} from {target_url}...")
 
-    print(f"Acessando: {target_url}")
-    
     try:
         r = session.get(target_url, timeout=20)
-        # Se redirecionar ou não for 200, assume vazio
-        if r.url != target_url and tab != "videos": # Às vezes /videos redireciona para Home se vazio, ok ignorar
-             pass 
-        
         html = r.text
         try:
             api_key, client_version = _extract_innertube(html)
@@ -216,27 +204,42 @@ def scrape_tab(session, base_url: str, tab: str, max_items: Optional[int]) -> Li
         items = []
         seen_ids = set()
         
-        # Extração inicial
-        page_items, continuation = _extract_from_initial_data(initial, is_short_tab=(tab=="shorts"))
+        page_items, continuation = _extract_from_data(initial, is_short_tab=(tab=="shorts"))
         
         for i in page_items:
             if i["id_interno"] not in seen_ids:
                 seen_ids.add(i["id_interno"])
+                
+                # --- BUSCA DESCRIÇÃO COMPLETA SE SOLICITADO ---
+                if fetch_full_desc:
+                    # Pequeno delay para não sobrecarregar
+                    time.sleep(0.05) 
+                    full_desc = _fetch_full_description_text(session, i["id_interno"])
+                    if full_desc:
+                        i["description"] = full_desc
+                
                 items.append({k:v for k,v in i.items() if k != "id_interno"})
 
-        # Paginação
         while continuation:
             if max_items and len(items) >= max_items: break
             time.sleep(0.1)
             
             data = _browse_req(session, api_key, client_version, continuation, target_url)
-            page_items, new_cont = _extract_from_initial_data(data, is_short_tab=(tab=="shorts"))
+            page_items, new_cont = _extract_from_data(data, is_short_tab=(tab=="shorts"))
             
             if not page_items: break
 
             for i in page_items:
                 if i["id_interno"] not in seen_ids:
                     seen_ids.add(i["id_interno"])
+                    
+                    # --- BUSCA DESCRIÇÃO COMPLETA ---
+                    if fetch_full_desc:
+                        time.sleep(0.05)
+                        full_desc = _fetch_full_description_text(session, i["id_interno"])
+                        if full_desc:
+                            i["description"] = full_desc
+
                     items.append({k:v for k,v in i.items() if k != "id_interno"})
                     if max_items and len(items) >= max_items: break
             
@@ -248,14 +251,14 @@ def scrape_tab(session, base_url: str, tab: str, max_items: Optional[int]) -> Li
         return items
 
     except Exception as e:
-        print(f"Erro em {tab}: {e}")
+        print(f"Erro no loop {tab}: {e}")
         return []
 
-# --- Rota API ---
+# --- Rota ---
 
 @app.get("/")
 def home():
-    return {"message": "API YouTube Scraper V2. Use /scrape"}
+    return {"message": "API YouTube Scraper V3 (Full Desc). Use /scrape"}
 
 @app.get("/scrape", response_model=ChannelResponse)
 def scrape_channel(
@@ -263,6 +266,7 @@ def scrape_channel(
     max_videos: Optional[int] = Query(None),
     max_lives: Optional[int] = Query(None),
     max_shorts: Optional[int] = Query(None),
+    full_description: bool = Query(True, description="Se True, entra em cada vídeo para pegar o texto completo."),
 ):
     session = requests.Session()
     session.headers.update({
@@ -270,13 +274,12 @@ def scrape_channel(
         "Accept-Language": "pt-BR"
     })
     
-    # Limpa URL
     base_url = channel_url.split("?")[0].rstrip("/")
     
-    # Coleta paralela (sequencial no código, mas separada)
-    videos = scrape_tab(session, base_url, "videos", max_videos)
-    lives = scrape_tab(session, base_url, "lives", max_lives)
-    shorts = scrape_tab(session, base_url, "shorts", max_shorts)
+    # Passamos o parâmetro full_description para cada função
+    videos = scrape_tab(session, base_url, "videos", max_videos, full_description)
+    lives = scrape_tab(session, base_url, "lives", max_lives, full_description)
+    shorts = scrape_tab(session, base_url, "shorts", max_shorts, full_description)
 
     return {
         "channel": base_url,
